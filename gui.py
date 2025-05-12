@@ -24,36 +24,27 @@ def start_server():
         # Determine the correct path for the executable
         if getattr(sys, 'frozen', False):
             base_path = sys._MEIPASS
+            server_path = os.path.join(base_path, 'server.exe')
+            proc = subprocess.Popen([server_path, port_entry.get().strip()])
         else:
             base_path = os.path.dirname(os.path.abspath(__file__))
-        
-        server_exe = os.path.join(base_path, 'server.exe')
+            # Development: run server.js with Node
+            server_path = os.path.join(base_path, 'server.js')
+            proc = subprocess.Popen(["node", server_path, port_entry.get().strip()])
 
-        # Get the port from the GUI
-        port = port_entry.get().strip()
-        if not port.isdigit():
-            print("Invalid port specified for server.")
-            return None
-
-        # Start the server process
-        proc = subprocess.Popen([server_exe, port])
-
-        # Wait for the security popup to be approved
         print("Waiting for server to start...")
-        time.sleep(5)  # Adjust this delay if needed
+        time.sleep(5)
 
-        # Check if the server is running
         if proc.poll() is not None:
             print("Server failed to start.")
             return None
 
-        print(f"Server started successfully on port {port}.")
+        print(f"Server started successfully on port {port_entry.get().strip()}.")
         return proc
 
     except Exception as e:
         print("Failed to start server:", e)
         return None
-
 
 # Function to start the listener in a separate thread
 def start_listener():
@@ -239,16 +230,27 @@ def submit_username():
     current_username = username
     try:
         port = port_entry.get()
-        # Send a POST request to the backend server to start the livestream
         res = requests.post(f"http://localhost:{port}/start", json={"username": username})
-        if res.ok:
+        try:
+            data = res.json()
+        except Exception as parse_err:
+            print("❌ JSON parse error:", parse_err)
+            data = {}
+
+        print("📦 Response status:", res.status_code)
+        print("📦 Response JSON:", data)
+
+
+        if res.status_code == 200 and data.get("success") == True:
             update_username_status(f"Streamer: @{username}", "green")
         else:
-            # Log the server response for debugging
-            print(f"Server response: {res.status_code} - {res.text}")
-            update_username_status("❌ Failed to connect to TikTok Live", "red")
+            error_msg = data.get("error", "Connection failed")
+            print(f"❌ Server error: {res.status_code} - {error_msg}")
+            update_username_status(f"❌ {error_msg}", "red")
+
     except Exception as e:
         update_username_status(f"❌ Could not connect to server: {e}", "red")
+
 
 def submit_keyword():
     keyword = keyword_entry.get().strip()  # Remove strip().lower() since server handles case
@@ -422,10 +424,14 @@ def listen_ws():
 
     except Exception as e:
         print(f"WebSocket connection error: {e}")
-        root.after(0, update_status, f"❌ WebSocket connection failed: {e}", "red")
-        retry_button.config(state=tk.NORMAL)
+        def fail():
+            update_status(f"❌ WebSocket connection failed: {e}", "red")
+            def fail():
+                update_status(f"❌ WebSocket connection failed: {e}", "red")
+                retry_button.config(state=tk.NORMAL)
+                root.after(0, fail)
 
-
+        root.after(0, fail)
 
 def retry_ws():
     retry_button.config(state=tk.DISABLED)
@@ -453,4 +459,3 @@ def on_close_window():
 
 if __name__ == "__main__":
     root.mainloop()
-

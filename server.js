@@ -2,12 +2,11 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const WebSocket = require('ws');
 const { WebcastPushConnection } = require('tiktok-live-connector');
-require('axios');
+
 
 const app = express();
 const port = process.argv[2] || 8080; // Change default port to 8080
 
-let tiktokConnection = null;
 let currentKeyword = '';
 let viewersSet = new Set();
 let wsClient = null;
@@ -82,33 +81,6 @@ server.on('close', () => {
     clearInterval(interval);
 });
 
-// Utility to check if a message matches the keyword
-function isValidKeywordMessage(message, keyword) {
-    const cleaned = message.trim().toLowerCase();
-
-    // Reject if the whole message is just "@keyword"
-    if (cleaned === '@' + keyword) return false;
-
-    const parts = cleaned.split(/\s+/);
-
-    // Remove leading @mentions
-    const words = parts.filter(word => !word.startsWith('@'));
-
-    if (words.length === 0) return false;
-
-    // Regex to match the keyword followed only by emojis, symbols, or numbers — no letters
-    const regex = new RegExp(`^${keyword}(?![a-z])[^\sa-zA-Z@]*$`);
-
-    // All remaining words must be valid keyword matches
-    for (const word of words) {
-        if (!regex.test(word)) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
 function createKeywordMatcher(keyword) {
     const normalizeText = (text) => {
         return text.toLowerCase()
@@ -122,64 +94,100 @@ function createKeywordMatcher(keyword) {
     const words = normalizedKeyword.split(/\s+/);
     
     if (words.length > 1) {
-        // For multi-word phrases
+        // Multi-word phrases (must be the entire message, ignoring punctuation between words)
         const phrasePattern = words
             .map(word => {
-                const baseWord = word.replace(/'/g, ""); // remove apostrophes for base matching
-                const escaped = baseWord.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-                return `${escaped}(?:'s|s)?`; // optional 's or s suffix
+                const baseWord = word.replace(/'/g, ""); // Remove apostrophes
+                const escaped = baseWord.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // Escape special characters
+                return `${escaped}(?:'s|s)?`; // Allow optional 's or s suffix
             })
-            .join("['''\\s]+"); // allow any type of apostrophe or space between words
+            .join("[\\s]*"); // Allow spaces between words
 
         return new RegExp(
-            `(?:^|\\s|@)${phrasePattern}(?:[!.?]*[\\u{1F300}-\\u{1F9FF}]*|\\s|$)`,
+            `^${phrasePattern}[!.?]*[\\u{1F300}-\\u{1F9FF}]*$`, // Must match the entire message
             'iu'
         );
     } else {
-        // For single words
-        const baseWord = words[0].replace(/'/g, ""); // remove apostrophes for base matching
-        const escaped = baseWord.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const repeated = escaped.replace(/(.)\1/g, '$1{2,}');
-        
+        // Single-word keywords (must be the entire message)
+        const baseWord = words[0].replace(/'/g, ""); // Remove apostrophes
+        const escaped = baseWord.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // Escape special characters
+
+        // Allow repeated characters (e.g., happyyyy but not happiness)
+        const repeated = escaped.replace(/(.)\1+/g, '$1{2,}');
+
         return new RegExp(
-            `(?:^|\\s|@)(?:${escaped}(?:'s|s)?|${repeated})(?:[!.?]*[\\u{1F300}-\\u{1F9FF}]*|\\s|$)`,
+            `^(${escaped}(?:'s|s)?|${repeated})[!.?]*[\\u{1F300}-\\u{1F9FF}]*$`, // Must match the entire message
             'iu'
         );
     }
 }
 
 // Start TikTok connection
+let tiktokConnection = null;
+
 app.post('/start', async (req, res) => {
-    const { username } = req.body;
-    if (!username) return res.status(400).send('Username required.');
+    const username = req.body.username;
+    if (!username) {
+        return res.status(400).json({ success: false, error: "Missing username" });
+    }
 
-    try {
-        tiktokConnection = new WebcastPushConnection(username);
+    // Clean up any previous connection
+    if (tiktokConnection) {
+        try {
+            await tiktokConnection.disconnect();
+            console.log("🔌 Previous TikTok connection closed");
+        } catch (err) {
+            console.log("⚠️ Error during disconnect:", err.message);
+        }
+        tiktokConnection = null;
+    }
 
-        tiktokConnection.on('chat', data => {
-            const nickname = data.nickname?.trim() || '';
-            const message = data.comment?.trim() || '';
-            console.log(`💬 ${nickname}: ${message}`);
+    const connection = new WebcastPushConnection(username);
+    let receivedChat = false;
 
-            if (currentKeyword && !viewersSet.has(nickname)) {
-                const matcher = createKeywordMatcher(currentKeyword);
-                if (matcher.test(message)) {
-                    viewersSet.add(nickname);
-                    if (wsClient && wsClient.readyState === WebSocket.OPEN) {
-                        wsClient.send(nickname);
-                    }
+    // Chat handler
+    connection.on('chat', data => {
+        receivedChat = true;
+        const viewerName = data.nickname || data.uniqueId;
+        const messageText = data.comment || '';
+        console.log(`${viewerName}: ${messageText}`);
+
+        if (!currentKeyword) return;
+
+        const regex = createKeywordMatcher(currentKeyword);
+        if (regex.test(messageText)) {
+            if (!viewersSet.has(viewerName)) {
+                viewersSet.add(viewerName);
+                if (wsClient && wsClient.readyState === WebSocket.OPEN) {
+                    wsClient.send(viewerName);
                 }
             }
-        });
+        }
+    });
 
-        await tiktokConnection.connect();
-        console.log(`✅ Connected to TikTok Live @${username}`);
-        res.send('Connected');
+    try {
+        const connectResult = await connection.connect();
+        console.log("🧪 connect() result:", connectResult);
+
+        // Wait up to 2.5 seconds to see if chat arrives
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
+        if (!receivedChat) {
+            console.log(`❌ @${username} is not live (no chat received)`);
+            await connection.disconnect();
+            return res.status(400).json({ success: false, error: "User is not live" });
+        }
+
+        console.log(`✅ Connected to @${username}`);
+        tiktokConnection = connection;
+        return res.json({ success: true });
+
     } catch (err) {
-        console.error('❌ Failed to connect:', err);
-        res.status(500).send('Connection failed');
+        console.log(`❌ Error connecting to @${username}:`, err.message);
+        return res.status(400).json({ success: false, error: err.message });
     }
 });
+
 
 // Set keyword
 app.post('/keyword', (req, res) => {
